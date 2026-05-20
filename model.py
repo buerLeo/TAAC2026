@@ -421,26 +421,14 @@ class RankMixerBlock(nn.Module):
         flat_x = x.reshape(B * T, D)
         flat_indices = top_indices.reshape(B * T, self.moe_top_k)
         flat_weights = top_weights.reshape(B * T, self.moe_top_k)
-        flat_out = torch.zeros_like(flat_x)
-        for expert_id, expert in enumerate(self.experts):
-            expert_mask = (flat_indices == expert_id).any(dim=-1)
-            if not bool(expert_mask.any().item()):
-                continue
-            for rank in range(self.moe_top_k):
-                rank_mask = flat_indices[expert_mask, rank] == expert_id
-                if rank == 0:
-                    expert_weight = flat_weights[expert_mask, rank].new_zeros(
-                        int(expert_mask.sum().item())
-                    )
-                expert_weight = expert_weight + torch.where(
-                    rank_mask,
-                    flat_weights[expert_mask, rank],
-                    torch.zeros_like(expert_weight),
-                )
-            flat_out[expert_mask] = (
-                flat_out[expert_mask]
-                + expert(flat_x[expert_mask]) * expert_weight.unsqueeze(-1)
-            )
+        # T is small in this model, so computing all experts and gathering
+        # top-k outputs is faster and safer than boolean-index routing loops.
+        all_expert_out = torch.stack(
+            [expert(flat_x) for expert in self.experts], dim=1
+        )  # (B*T, E, D)
+        gather_idx = flat_indices.unsqueeze(-1).expand(-1, -1, D)
+        selected = torch.gather(all_expert_out, dim=1, index=gather_idx)
+        flat_out = (selected * flat_weights.unsqueeze(-1)).sum(dim=1)
         return flat_out.view(B, T, D)
 
     def sparse_moe_with_token_attention(self, Q: torch.Tensor) -> torch.Tensor:

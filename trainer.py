@@ -8,6 +8,7 @@ import os
 import glob
 import shutil
 import logging
+import time
 from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 
@@ -312,12 +313,21 @@ class PCVRHyFormerRankingTrainer:
         total_step = 0
 
         for epoch in range(1, self.num_epochs + 1):
+            epoch_start = time.perf_counter()
+            logging.info(f"Epoch {epoch} start: waiting for first train batch")
             train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
                               dynamic_ncols=True)
             loss_sum = 0.0
 
             for step, batch in train_pbar:
+                if step == 0:
+                    logging.info(
+                        f"Epoch {epoch} first batch loaded after "
+                        f"{time.perf_counter() - epoch_start:.2f}s")
+                    logging.info(f"Epoch {epoch} first train step started")
+                step_start = time.perf_counter()
                 loss = self._train_step(batch)
+                step_time = time.perf_counter() - step_start
                 total_step += 1
                 loss_sum += loss
 
@@ -325,6 +335,10 @@ class PCVRHyFormerRankingTrainer:
                     self.writer.add_scalar('Loss/train', loss, total_step)
 
                 train_pbar.set_postfix({"loss": f"{loss:.4f}"})
+                if total_step == 1 or total_step % 50 == 0:
+                    logging.info(
+                        f"Train step {total_step} | epoch={epoch} step={step} "
+                        f"loss={loss:.4f} step_time={step_time:.2f}s")
 
                 # Step-level validation (only when eval_every_n_steps > 0).
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
