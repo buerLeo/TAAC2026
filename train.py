@@ -136,17 +136,12 @@ def parse_args() -> argparse.Namespace:
                         help='Disable current-sample hour/weekday NS tokens')
     parser.add_argument('--calendar_time_offset_hours', type=int, default=8,
                         help='UTC offset used to derive hour/weekday from timestamp')
-    parser.add_argument('--rank_mixer_mode', type=str, default='sparse_moe',
-                        choices=['full', 'ffn_only', 'sparse_moe', 'none'],
+    parser.add_argument('--rank_mixer_mode', type=str, default='full',
+                        choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '
                              'full = token mixing + per-token FFN (requires d_model divisible by T), '
                              'ffn_only = per-token FFN only, '
-                             'sparse_moe = token-wise top-k sparse expert FFN, '
                              'none = identity passthrough')
-    parser.add_argument('--moe_num_experts', type=int, default=4,
-                        help='Number of FFN experts used by sparse_moe mode')
-    parser.add_argument('--moe_top_k', type=int, default=2,
-                        help='Number of experts selected per token in sparse_moe mode')
     parser.add_argument('--use_rope', action='store_true', default=False,
                         help='Enable RoPE positional encoding in sequence attention')
     parser.add_argument('--rope_base', type=float, default=10000.0,
@@ -317,8 +312,6 @@ def main() -> None:
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
         "use_calendar_time": args.use_calendar_time,
-        "moe_num_experts": args.moe_num_experts,
-        "moe_top_k": args.moe_top_k,
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
