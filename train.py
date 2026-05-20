@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--num_epochs', type=int, default=999,
                         help='Maximum number of training epochs '
                              '(typically terminated earlier by early stopping)')
-    parser.add_argument('--patience', type=int, default=5,
+    parser.add_argument('--patience', type=int, default=3,
                         help='Early-stopping patience '
                              '(number of validations without improvement)')
     parser.add_argument('--seed', type=int, default=42,
@@ -67,6 +67,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Training device, e.g. cuda or cpu')
+    parser.add_argument('--amp', action='store_true', default=True,
+                        help='Enable CUDA automatic mixed precision (default on)')
+    parser.add_argument('--no_amp', dest='amp', action='store_false',
+                        help='Disable CUDA automatic mixed precision')
+    parser.add_argument('--amp_dtype', type=str, default='fp16',
+                        choices=['fp16', 'bf16'],
+                        help='AMP autocast dtype when --amp is enabled')
 
     # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
@@ -86,7 +93,7 @@ def parse_args() -> argparse.Namespace:
                         help='Per-domain sequence truncation, format: seq_d:256,seq_c:128')
 
     # Model hyperparameters.
-    parser.add_argument('--d_model', type=int, default=64,
+    parser.add_argument('--d_model', type=int, default=72,
                         help='Backbone hidden dimension (output size of each block)')
     parser.add_argument('--emb_dim', type=int, default=64,
                         help='Per-Embedding-table dimension (before projection)')
@@ -123,12 +130,23 @@ def parse_args() -> argparse.Namespace:
                              'dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.')
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
-    parser.add_argument('--rank_mixer_mode', type=str, default='full',
-                        choices=['full', 'ffn_only', 'none'],
+    parser.add_argument('--use_calendar_time', action='store_true', default=True,
+                        help='Enable current-sample hour/weekday NS tokens (default on)')
+    parser.add_argument('--no_calendar_time', dest='use_calendar_time', action='store_false',
+                        help='Disable current-sample hour/weekday NS tokens')
+    parser.add_argument('--calendar_time_offset_hours', type=int, default=8,
+                        help='UTC offset used to derive hour/weekday from timestamp')
+    parser.add_argument('--rank_mixer_mode', type=str, default='sparse_moe',
+                        choices=['full', 'ffn_only', 'sparse_moe', 'none'],
                         help='RankMixerBlock mode: '
                              'full = token mixing + per-token FFN (requires d_model divisible by T), '
                              'ffn_only = per-token FFN only, '
+                             'sparse_moe = token-wise top-k sparse expert FFN, '
                              'none = identity passthrough')
+    parser.add_argument('--moe_num_experts', type=int, default=4,
+                        help='Number of FFN experts used by sparse_moe mode')
+    parser.add_argument('--moe_top_k', type=int, default=2,
+                        help='Number of experts selected per token in sparse_moe mode')
     parser.add_argument('--use_rope', action='store_true', default=False,
                         help='Enable RoPE positional encoding in sequence attention')
     parser.add_argument('--rope_base', type=float, default=10000.0,
@@ -298,6 +316,9 @@ def main() -> None:
         "rope_base": args.rope_base,
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
+        "use_calendar_time": args.use_calendar_time,
+        "moe_num_experts": args.moe_num_experts,
+        "moe_top_k": args.moe_top_k,
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
@@ -350,6 +371,10 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        use_amp=args.amp,
+        amp_dtype=args.amp_dtype,
+        use_calendar_time=args.use_calendar_time,
+        calendar_time_offset_hours=args.calendar_time_offset_hours,
     )
 
     trainer.train()

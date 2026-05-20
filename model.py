@@ -16,6 +16,8 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    time_hour: Optional[torch.Tensor] = None  # current sample hour, [B]
+    time_weekday: Optional[torch.Tensor] = None  # current sample weekday, [B]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -327,9 +329,12 @@ class RankMixerBlock(nn.Module):
         self,
         d_model: int,
         n_total: int,  # T = Nq + Nns
+        num_heads: int = 4,
         hidden_mult: int = 4,
         dropout: float = 0.0,
-        mode: str = 'full'  # 'full' | 'ffn_only' | 'none'
+        mode: str = 'sparse_moe',  # 'full' | 'ffn_only' | 'sparse_moe' | 'none'
+        moe_num_experts: int = 4,
+        moe_top_k: int = 2,
     ) -> None:
         super().__init__()
         self.T = n_total
@@ -347,13 +352,35 @@ class RankMixerBlock(nn.Module):
                 )
             self.d_sub = d_model // n_total
 
-        # Per-token FFN (shared parameters) — used by both 'full' and 'ffn_only'
+        # Per-token FFN (shared parameters) — used by both 'full' and 'ffn_only'.
         self.norm = nn.LayerNorm(d_model)
-        self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
-        self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
         self.dropout = nn.Dropout(dropout)
-        # Post-LN after residual to stabilize stacked block outputs
         self.post_norm = nn.LayerNorm(d_model)
+        if mode == 'sparse_moe':
+            if moe_num_experts <= 0:
+                raise ValueError("moe_num_experts must be positive")
+            self.num_experts = moe_num_experts
+            self.moe_top_k = max(1, min(moe_top_k, moe_num_experts))
+            self.attn_norm = nn.LayerNorm(d_model)
+            self.token_attn = RoPEMultiheadAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                dropout=dropout,
+                rope_on_q=False,
+            )
+            self.gate = nn.Linear(d_model, moe_num_experts)
+            self.experts = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(d_model, d_model * hidden_mult),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(d_model * hidden_mult, d_model),
+                )
+                for _ in range(moe_num_experts)
+            ])
+        else:
+            self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
+            self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
 
     def token_mixing(self, Q: torch.Tensor) -> torch.Tensor:
         """Performs parameter-free token mixing via reshape and transpose.
@@ -381,6 +408,53 @@ class RankMixerBlock(nn.Module):
         Q_hat = Q_rewired.view(B, T, D)
         return Q_hat
 
+    def sparse_moe(self, Q: torch.Tensor) -> torch.Tensor:
+        """Apply token-wise top-k sparse MoE over shared query/NS tokens."""
+        B, T, D = Q.shape
+        x = self.norm(Q)
+        gate_logits = self.gate(x)  # (B, T, E)
+        top_values, top_indices = torch.topk(
+            gate_logits, k=self.moe_top_k, dim=-1
+        )
+        top_weights = F.softmax(top_values, dim=-1)
+
+        flat_x = x.reshape(B * T, D)
+        flat_indices = top_indices.reshape(B * T, self.moe_top_k)
+        flat_weights = top_weights.reshape(B * T, self.moe_top_k)
+        flat_out = torch.zeros_like(flat_x)
+        for expert_id, expert in enumerate(self.experts):
+            expert_mask = (flat_indices == expert_id).any(dim=-1)
+            if not bool(expert_mask.any().item()):
+                continue
+            for rank in range(self.moe_top_k):
+                rank_mask = flat_indices[expert_mask, rank] == expert_id
+                if rank == 0:
+                    expert_weight = flat_weights[expert_mask, rank].new_zeros(
+                        int(expert_mask.sum().item())
+                    )
+                expert_weight = expert_weight + torch.where(
+                    rank_mask,
+                    flat_weights[expert_mask, rank],
+                    torch.zeros_like(expert_weight),
+                )
+            flat_out[expert_mask] = (
+                flat_out[expert_mask]
+                + expert(flat_x[expert_mask]) * expert_weight.unsqueeze(-1)
+            )
+        return flat_out.view(B, T, D)
+
+    def sparse_moe_with_token_attention(self, Q: torch.Tensor) -> torch.Tensor:
+        """Mix query/NS tokens with self-attention, then apply sparse MoE FFN."""
+        attn_in = self.attn_norm(Q)
+        attn_out, _ = self.token_attn(
+            query=attn_in,
+            key=attn_in,
+            value=attn_in,
+        )
+        mixed = Q + self.dropout(attn_out)
+        moe_out = self.sparse_moe(mixed)
+        return self.post_norm(mixed + moe_out)
+
     def forward(self, Q: torch.Tensor) -> torch.Tensor:
         """Applies query boosting: token mixing, FFN, and residual connection.
 
@@ -392,6 +466,9 @@ class RankMixerBlock(nn.Module):
         """
         if self.mode == 'none':
             return Q
+
+        if self.mode == 'sparse_moe':
+            return self.sparse_moe_with_token_attention(Q)
 
         # Token Mixing (parameter-free rewire) or identity
         if self.mode == 'full':
@@ -867,7 +944,9 @@ class MultiSeqHyFormerBlock(nn.Module):
         dropout: float = 0.0,
         top_k: int = 50,
         causal: bool = False,
-        rank_mixer_mode: str = 'full'
+        rank_mixer_mode: str = 'sparse_moe',
+        moe_num_experts: int = 4,
+        moe_top_k: int = 2,
     ) -> None:
         super().__init__()
         self.num_sequences = num_sequences
@@ -904,9 +983,12 @@ class MultiSeqHyFormerBlock(nn.Module):
         self.mixer = RankMixerBlock(
             d_model=d_model,
             n_total=n_total,
+            num_heads=num_heads,
             hidden_mult=hidden_mult,
             dropout=dropout,
-            mode=rank_mixer_mode
+            mode=rank_mixer_mode,
+            moe_num_experts=moe_num_experts,
+            moe_top_k=moe_top_k,
         )
 
     def forward(
@@ -1220,11 +1302,14 @@ class PCVRHyFormer(nn.Module):
         seq_causal: bool = False,
         action_num: int = 1,
         num_time_buckets: int = 65,
-        rank_mixer_mode: str = 'full',
+        rank_mixer_mode: str = 'sparse_moe',
         use_rope: bool = False,
         rope_base: float = 10000.0,
         emb_skip_threshold: int = 0,
         seq_id_threshold: int = 10000,
+        use_calendar_time: bool = True,
+        moe_num_experts: int = 4,
+        moe_top_k: int = 2,
         # NS tokenizer variant
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
@@ -1243,7 +1328,10 @@ class PCVRHyFormer(nn.Module):
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
+        self.use_calendar_time = use_calendar_time
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.moe_num_experts = moe_num_experts
+        self.moe_top_k = moe_top_k
 
         # ================== NS Tokens Construction ==================
 
@@ -1311,9 +1399,14 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        if self.use_calendar_time:
+            self.hour_embedding = nn.Embedding(24, d_model)
+            self.weekday_embedding = nn.Embedding(7, d_model)
+
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+                       + num_item_ns + (1 if self.has_item_dense else 0)
+                       + (2 if self.use_calendar_time else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1401,6 +1494,8 @@ class PCVRHyFormer(nn.Module):
                 top_k=seq_top_k,
                 causal=seq_causal,
                 rank_mixer_mode=rank_mixer_mode,
+                moe_num_experts=moe_num_experts,
+                moe_top_k=moe_top_k,
             )
             for _ in range(num_hyformer_blocks)
         ])
@@ -1466,6 +1561,10 @@ class PCVRHyFormer(nn.Module):
         if self.num_time_buckets > 0:
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
+
+        if self.use_calendar_time:
+            nn.init.xavier_normal_(self.hour_embedding.weight.data)
+            nn.init.xavier_normal_(self.weekday_embedding.weight.data)
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1631,6 +1730,21 @@ class PCVRHyFormer(nn.Module):
 
         return output
 
+    def _calendar_time_tokens(self, inputs: ModelInput, batch_size: int) -> List[torch.Tensor]:
+        """Build current-sample calendar-time NS tokens."""
+        if not self.use_calendar_time:
+            return []
+        device = inputs.user_int_feats.device
+        hour_ids = inputs.time_hour
+        weekday_ids = inputs.time_weekday
+        if hour_ids is None:
+            hour_ids = torch.zeros(batch_size, dtype=torch.long, device=device)
+        if weekday_ids is None:
+            weekday_ids = torch.zeros(batch_size, dtype=torch.long, device=device)
+        hour_tok = self.hour_embedding(hour_ids.clamp(0, 23)).unsqueeze(1)
+        weekday_tok = self.weekday_embedding(weekday_ids.clamp(0, 6)).unsqueeze(1)
+        return [hour_tok, weekday_tok]
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
@@ -1645,6 +1759,7 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
+        ns_parts.extend(self._calendar_time_tokens(inputs, inputs.user_int_feats.shape[0]))
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -1688,6 +1803,7 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
+        ns_parts.extend(self._calendar_time_tokens(inputs, inputs.user_int_feats.shape[0]))
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 

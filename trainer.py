@@ -8,6 +8,7 @@ import os
 import glob
 import shutil
 import logging
+from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -58,6 +59,10 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        use_amp: bool = True,
+        amp_dtype: str = 'fp16',
+        use_calendar_time: bool = True,
+        calendar_time_offset_hours: int = 8,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -107,10 +112,21 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.amp_enabled: bool = bool(use_amp and str(device).startswith('cuda'))
+        self.amp_dtype = torch.float16 if amp_dtype == 'fp16' else torch.bfloat16
+        self.grad_scaler = torch.cuda.amp.GradScaler(
+            enabled=self.amp_enabled and amp_dtype == 'fp16'
+        )
+        self.use_calendar_time: bool = use_calendar_time
+        self.calendar_time_offset_seconds: int = calendar_time_offset_hours * 3600
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+        logging.info(f"AMP enabled={self.amp_enabled}, dtype={amp_dtype}, "
+                     f"grad_scaler={self.grad_scaler.is_enabled()}")
+        logging.info(f"Calendar time enabled={self.use_calendar_time}, "
+                     f"offset_hours={calendar_time_offset_hours}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -381,6 +397,20 @@ class PCVRHyFormerRankingTrainer:
         seq_data: Dict[str, torch.Tensor] = {}
         seq_lens: Dict[str, torch.Tensor] = {}
         seq_time_buckets: Dict[str, torch.Tensor] = {}
+        time_hour = None
+        time_weekday = None
+        if self.use_calendar_time and 'timestamp' in device_batch:
+            ts = device_batch['timestamp'].long()
+            ts_abs = ts.abs()
+            ts_seconds = torch.where(
+                ts_abs >= 100_000_000_000_000,
+                ts // 1_000_000,
+                torch.where(ts_abs >= 100_000_000_000, ts // 1_000, ts),
+            )
+            local_seconds = ts_seconds + self.calendar_time_offset_seconds
+            time_hour = ((local_seconds // 3600) % 24).long()
+            # Unix epoch 1970-01-01 was Thursday; Monday is encoded as 0.
+            time_weekday = (((local_seconds // 86400) + 3) % 7).long()
         for domain in seq_domains:
             seq_data[domain] = device_batch[domain]
             seq_lens[domain] = device_batch[f'{domain}_len']
@@ -397,6 +427,8 @@ class PCVRHyFormerRankingTrainer:
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
+            time_hour=time_hour,
+            time_weekday=time_weekday,
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:
@@ -409,21 +441,40 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
+        amp_context = (
+            torch.autocast(device_type='cuda', dtype=self.amp_dtype)
+            if self.amp_enabled else nullcontext()
+        )
 
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+        with amp_context:
+            logits = self.model(model_input)  # (B, 1)
+            logits = logits.squeeze(-1)  # (B,)
+
+            if self.loss_type == 'focal':
+                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
+
+        if self.grad_scaler.is_enabled():
+            self.grad_scaler.scale(loss).backward()
+            self.grad_scaler.unscale_(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.grad_scaler.unscale_(self.sparse_optimizer)
         else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
-        loss.backward()
+            loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
 
-        self.dense_optimizer.step()
-        if self.sparse_optimizer is not None:
-            self.sparse_optimizer.step()
+        if self.grad_scaler.is_enabled():
+            self.grad_scaler.step(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.grad_scaler.step(self.sparse_optimizer)
+            self.grad_scaler.update()
+        else:
+            self.dense_optimizer.step()
+            if self.sparse_optimizer is not None:
+                self.sparse_optimizer.step()
 
         return loss.item()
 
