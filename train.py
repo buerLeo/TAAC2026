@@ -12,6 +12,7 @@ Environment variables (take precedence over CLI flags):
 import os
 import json
 import argparse
+import inspect
 import logging
 from pathlib import Path
 from typing import List, Tuple
@@ -342,33 +343,48 @@ def main() -> None:
         "hidden": args.d_model,
     }
 
-    trainer = PCVRHyFormerRankingTrainer(
-        model=model,
-        train_loader=train_loader,
-        valid_loader=valid_loader,
-        lr=args.lr,
-        num_epochs=args.num_epochs,
-        device=args.device,
-        save_dir=args.ckpt_dir,
-        early_stopping=early_stopping,
-        loss_type=args.loss_type,
-        focal_alpha=args.focal_alpha,
-        focal_gamma=args.focal_gamma,
-        sparse_lr=args.sparse_lr,
-        sparse_weight_decay=args.sparse_weight_decay,
-        reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,
-        reinit_cardinality_threshold=args.reinit_cardinality_threshold,
-        ckpt_params=ckpt_params,
-        writer=writer,
-        schema_path=schema_path,
-        ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
-        eval_every_n_steps=args.eval_every_n_steps,
-        train_config=vars(args),
-        use_amp=args.amp,
-        amp_dtype=args.amp_dtype,
-        use_calendar_time=args.use_calendar_time,
-        calendar_time_offset_hours=args.calendar_time_offset_hours,
+    trainer_kwargs = {
+        "model": model,
+        "train_loader": train_loader,
+        "valid_loader": valid_loader,
+        "lr": args.lr,
+        "num_epochs": args.num_epochs,
+        "device": args.device,
+        "save_dir": args.ckpt_dir,
+        "early_stopping": early_stopping,
+        "loss_type": args.loss_type,
+        "focal_alpha": args.focal_alpha,
+        "focal_gamma": args.focal_gamma,
+        "sparse_lr": args.sparse_lr,
+        "sparse_weight_decay": args.sparse_weight_decay,
+        "reinit_sparse_after_epoch": args.reinit_sparse_after_epoch,
+        "reinit_cardinality_threshold": args.reinit_cardinality_threshold,
+        "ckpt_params": ckpt_params,
+        "writer": writer,
+        "schema_path": schema_path,
+        "ns_groups_path": args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
+        "eval_every_n_steps": args.eval_every_n_steps,
+        "train_config": vars(args),
+        "use_amp": args.amp,
+        "amp_dtype": args.amp_dtype,
+        "use_calendar_time": args.use_calendar_time,
+        "calendar_time_offset_hours": args.calendar_time_offset_hours,
+    }
+    trainer_params = inspect.signature(PCVRHyFormerRankingTrainer.__init__).parameters
+    unsupported_kwargs = sorted(
+        set(trainer_kwargs) - set(trainer_params) - {"self"}
     )
+    if unsupported_kwargs:
+        logging.warning(
+            "Trainer does not support kwargs %s; dropping them for compatibility. "
+            "Please ensure trainer.py is uploaded from the same code revision as train.py.",
+            unsupported_kwargs,
+        )
+    trainer_kwargs = {
+        k: v for k, v in trainer_kwargs.items()
+        if k in trainer_params
+    }
+    trainer = PCVRHyFormerRankingTrainer(**trainer_kwargs)
 
     trainer.train()
     writer.close()
