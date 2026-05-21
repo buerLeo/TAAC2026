@@ -68,8 +68,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Training device, e.g. cuda or cpu')
-    parser.add_argument('--amp', action='store_true', default=True,
-                        help='Enable CUDA automatic mixed precision (default on)')
+    parser.add_argument('--amp', action='store_true', default=False,
+                        help='Enable CUDA automatic mixed precision')
     parser.add_argument('--no_amp', dest='amp', action='store_false',
                         help='Disable CUDA automatic mixed precision')
     parser.add_argument('--amp_dtype', type=str, default='fp16',

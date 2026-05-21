@@ -65,6 +65,7 @@ _FALLBACK_MODEL_CFG = {
     'rope_base': 10000.0,
     'emb_skip_threshold': 0,
     'seq_id_threshold': 10000,
+    'use_calendar_time': False,
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 0,
     'item_ns_tokens': 0,
@@ -271,6 +272,8 @@ def get_ckpt_path() -> Optional[str]:
 def _batch_to_model_input(
     batch: Dict[str, Any],
     device: str,
+    use_calendar_time: bool = False,
+    calendar_time_offset_hours: int = 8,
 ) -> ModelInput:
     """Convert a batch dict to ``ModelInput``, handling dynamic seq domains."""
     device_batch: Dict[str, Any] = {}
@@ -284,6 +287,20 @@ def _batch_to_model_input(
     seq_data: Dict[str, torch.Tensor] = {}
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
+    time_hour = None
+    time_weekday = None
+    if use_calendar_time and 'timestamp' in device_batch:
+        ts = device_batch['timestamp'].long()
+        ts_abs = ts.abs()
+        ts_seconds = torch.where(
+            ts_abs >= 100_000_000_000_000,
+            ts // 1_000_000,
+            torch.where(ts_abs >= 100_000_000_000, ts // 1_000, ts),
+        )
+        local_seconds = ts_seconds + calendar_time_offset_hours * 3600
+        time_hour = ((local_seconds // 3600) % 24).long()
+        # Unix epoch 1970-01-01 was Thursday; Monday is encoded as 0.
+        time_weekday = (((local_seconds // 86400) + 3) % 7).long()
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
@@ -300,6 +317,8 @@ def _batch_to_model_input(
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        time_hour=time_hour,
+        time_weekday=time_weekday,
     )
 
 
@@ -395,7 +414,14 @@ def main() -> None:
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(test_loader):
-            model_input = _batch_to_model_input(batch, device)
+            model_input = _batch_to_model_input(
+                batch,
+                device,
+                use_calendar_time=bool(model_cfg.get('use_calendar_time', False)),
+                calendar_time_offset_hours=int(
+                    train_config.get('calendar_time_offset_hours', 8)
+                ),
+            )
             user_ids = batch.get('user_id', [])
 
             logits, _ = model.predict(model_input)

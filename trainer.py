@@ -60,7 +60,7 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
-        use_amp: bool = True,
+        use_amp: bool = False,
         amp_dtype: str = 'fp16',
         use_calendar_time: bool = True,
         calendar_time_offset_hours: int = 8,
