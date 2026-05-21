@@ -18,6 +18,7 @@ Environment variables:
 """
 
 import os
+import inspect
 import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -222,16 +223,34 @@ def build_model(
         dataset.item_int_schema, dataset.item_int_vocab_sizes)
 
     logging.info(f"Building PCVRHyFormer with cfg: {model_cfg}")
-    model = PCVRHyFormer(
-        user_int_feature_specs=user_int_feature_specs,
-        item_int_feature_specs=item_int_feature_specs,
-        user_dense_dim=dataset.user_dense_schema.total_dim,
-        item_dense_dim=dataset.item_dense_schema.total_dim,
-        seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
-        user_ns_groups=user_ns_groups,
-        item_ns_groups=item_ns_groups,
+    model_kwargs = {
+        "user_int_feature_specs": user_int_feature_specs,
+        "item_int_feature_specs": item_int_feature_specs,
+        "user_dense_dim": dataset.user_dense_schema.total_dim,
+        "item_dense_dim": dataset.item_dense_schema.total_dim,
+        "seq_vocab_sizes": dataset.seq_domain_vocab_sizes,
+        "user_ns_groups": user_ns_groups,
+        "item_ns_groups": item_ns_groups,
         **model_cfg,
-    ).to(device)
+    }
+    model_params = inspect.signature(PCVRHyFormer.__init__).parameters
+    unsupported_kwargs = sorted(
+        set(model_kwargs) - set(model_params) - {"self"}
+    )
+    if unsupported_kwargs:
+        logging.warning(
+            "PCVRHyFormer.__init__ does not support kwargs %s; dropping them for compatibility. "
+            "If this checkpoint was trained with any of these features enabled, "
+            "the evaluation package is using an older model.py and strict weight "
+            "loading will likely fail. Please submit infer.py and model.py from "
+            "the same code revision as the checkpoint.",
+            unsupported_kwargs,
+        )
+    model_kwargs = {
+        k: v for k, v in model_kwargs.items()
+        if k in model_params
+    }
+    model = PCVRHyFormer(**model_kwargs).to(device)
 
     return model
 
